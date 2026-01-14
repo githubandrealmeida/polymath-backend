@@ -1,0 +1,12 @@
+{
+  "name": "polymath-backend",
+  "version": "1.0.0",
+  "description": "Serverless backend for PolyMath using Vercel functions",
+  "main": "api/polymarket.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC"
+}

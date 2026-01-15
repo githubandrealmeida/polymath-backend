@@ -1,264 +1,311 @@
-// Serverless function for PolyMath backend
-// Handles Polymarket API requests with CORS enabled
-
-export default async (req, res) => {
-  // Enable CORS
+// /api/polymarket.js
+export default async function handler(req, res) {
+  // CORS
   res.setHeader('Access-Control-Allow-Credentials', 'true');
   res.setHeader('Access-Control-Allow-Origin', '*');
-  res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS,PATCH,DELETE,POST,PUT');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
   res.setHeader(
     'Access-Control-Allow-Headers',
     'X-CSRF-Token, X-Requested-With, Accept, Accept-Version, Content-Length, Content-MD5, Content-Type, Date, X-Api-Version'
   );
 
-  // Handle preflight
-  if (req.method === 'OPTIONS') {
-    res.status(200).end();
-    return;
-  }
+  if (req.method === 'OPTIONS') return res.status(200).end();
+  if (req.method !== 'GET') return res.status(405).json({ success: false, error: 'Method not allowed' });
 
-  // Extract slug from query params
   const { slug, type } = req.query;
 
-  // Route different requests
-  if (type === 'market-data' && slug) {
-    return fetchMarketData(slug, res);
-  } else if (type === 'prices' && slug) {
-    return fetchPrices(slug, res);
-  } else {
-    // Default response
+  try {
+    if (type === 'market-data' && slug) {
+      const data = await fetchMarketData(slug);
+      return res.status(200).json({ success: true, ...data });
+    }
+
+    if (type === 'prices' && slug) {
+      const data = await fetchPrices({
+        slug,
+        tokenId: req.query.tokenId,
+        outcomeIndex: req.query.outcomeIndex
+      });
+      return res.status(200).json({ success: true, ...data });
+    }
+
     return res.status(200).json({
+      success: true,
       status: 'ok',
       message: 'PolyMath Backend API is running',
       timestamp: new Date().toISOString(),
       endpoints: {
         marketData: '/api/polymarket?type=market-data&slug=YOUR_SLUG',
-        prices: '/api/polymarket?type=prices&slug=YOUR_SLUG&outcomeIndex=0'
+        pricesByToken: '/api/polymarket?type=prices&slug=YOUR_SLUG&tokenId=TOKEN_ID',
+        pricesLegacy: '/api/polymarket?type=prices&slug=YOUR_SLUG&outcomeIndex=0'
       }
     });
-  }
-};
-
-// ========== MARKET DATA: recorre eventData.markets ==========
-async function fetchMarketData(slug, res) {
-  try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 10000);
-
-    const gammaUrl = `https://gamma-api.polymarket.com/events?slug=${encodeURIComponent(slug)}`;
-    const gammaResponse = await fetch(gammaUrl, { signal: controller.signal });
-
-    if (!gammaResponse.ok) {
-      clearTimeout(timeoutId);
-      return res.status(gammaResponse.status).json({
-        error: `Gamma API error: ${gammaResponse.status}`,
-        slug
-      });
-    }
-
-    const events = await gammaResponse.json();
-    clearTimeout(timeoutId);
-
-    if (!Array.isArray(events) || events.length === 0) {
-      return res.status(404).json({
-        error: `Market "${slug}" not found`,
-        slug
-      });
-    }
-
-    const eventData = events[0];
-    const markets = Array.isArray(eventData.markets) ? eventData.markets : [];
-
-    if (markets.length === 0) {
-      return res.status(404).json({
-        error: 'No active markets for this event',
-        slug
-      });
-    }
-
-    const eventTitle = eventData.title || 'Polymarket Event';
-    const outcomes = [];
-    let totalVolume = 0;
-
-    markets.forEach((m, idx) => {
-      totalVolume += parseFloat(m.volume || 0);
-
-      // outcomePrices de ese market (normalmente [NO, YES] o [0,1])
-      let prices = [];
-      try {
-        prices = JSON.parse(m.outcomePrices || '[]');
-      } catch (e) {
-        prices = [];
-      }
-
-      // Heurística: si hay al menos 2 precios, cogemos el segundo como YES; si no, el primero
-      const yesPrice = prices.length >= 2
-        ? parseFloat(prices[1])
-        : parseFloat(prices[0] || '0.5');
-
-      // nombres: usamos m.question como nombre principal
-      const name = m.question || `Market ${idx + 1}`;
-
-      // clobTokenIds por market
-      let tokenIds = m.clobTokenIds;
-      if (typeof tokenIds === 'string') {
-        try {
-          tokenIds = JSON.parse(tokenIds);
-        } catch (e) {
-          // lo dejamos tal cual
-        }
-      }
-
-      // Heurística: tokenId asociado al YES de ese market (segundo si hay 2, si no primero)
-      let tokenId = null;
-      if (Array.isArray(tokenIds) && tokenIds.length > 0) {
-        tokenId = tokenIds.length >= 2 ? tokenIds[1] : tokenIds[0];
-      }
-
-      outcomes.push({
-        index: idx,        // índice del market dentro de eventData.markets
-        name,              // pregunta/descripcion del candidato
-        yesPrice: isNaN(yesPrice) ? 0.5 : yesPrice,
-        tokenId
-      });
-    });
-
-    // midPrice: tomamos el YES del outcome "favorito" (mayor yesPrice)
-    const bestOutcome = outcomes.reduce(
-      (prev, curr) => (prev.yesPrice > curr.yesPrice ? prev : curr),
-      outcomes[0]
-    );
-    const midPrice = bestOutcome ? bestOutcome.yesPrice : 0.5;
-
-    return res.status(200).json({
-      success: true,
-      marketName: eventTitle,
-      volume: totalVolume,
-      slug,
-      midPrice,
-      outcomes, // lista de "candidatos" = markets del evento
-      timestamp: new Date().toISOString()
-    });
-  } catch (error) {
-    console.error('Error fetching market data:', error);
-    return res.status(500).json({
-      error: error.message || 'Internal Server Error',
-      slug
-    });
+  } catch (err) {
+    const status = err?.statusCode || 500;
+    return res.status(status).json({ success: false, error: err?.message || 'Internal Server Error' });
   }
 }
 
-// ========== PRICES: usa eventData.markets[outcomeIndex] ==========
-async function fetchPrices(slug, res) {
+// ---------------- Helpers ----------------
+
+function withTimeout(ms = 10000) {
+  const controller = new AbortController();
+  const timeoutId = setTimeout(() => controller.abort(), ms);
+  return { controller, timeoutId };
+}
+
+async function fetchJson(url, { signal } = {}) {
+  const r = await fetch(url, { signal });
+  if (!r.ok) {
+    const text = await safeReadText(r);
+    const e = new Error(`HTTP ${r.status} for ${url}${text ? ` | ${text}` : ''}`);
+    e.statusCode = r.status;
+    throw e;
+  }
+  return r.json();
+}
+
+async function safeReadText(resp) {
+  try { return await resp.text(); } catch { return ''; }
+}
+
+function parseMaybeJson(value, fallback) {
+  if (value == null) return fallback;
+  if (Array.isArray(value)) return value;
+  if (typeof value !== 'string') return fallback;
+  try { return JSON.parse(value); } catch { return fallback; }
+}
+
+function toNumber(x, fallback = 0) {
+  const n = typeof x === 'number' ? x : parseFloat(x);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function clamp(n, min, max) {
+  return Math.min(Math.max(n, min), max);
+}
+
+async function fetchGammaEventBySlug(slug, signal) {
+  const url = `https://gamma-api.polymarket.com/events?slug=${encodeURIComponent(slug)}`;
+  const events = await fetchJson(url, { signal });
+  if (!Array.isArray(events) || events.length === 0) {
+    const e = new Error(`Market "${slug}" not found`);
+    e.statusCode = 404;
+    throw e;
+  }
+  return events[0];
+}
+
+function normalizeMarketArrays(market) {
+  // Gamma a veces trae strings JSON
+  const outcomes = parseMaybeJson(market?.outcomes, null);          // array de nombres (multi)
+  const outcomePrices = parseMaybeJson(market?.outcomePrices, []); // array de precios
+  const clobTokenIds = parseMaybeJson(market?.clobTokenIds, []);   // array de tokenIds
+  return { outcomes, outcomePrices, clobTokenIds };
+}
+
+function isMultiOutcomeSingleMarket(markets) {
+  if (!Array.isArray(markets) || markets.length !== 1) return false;
+  const { outcomes, clobTokenIds } = normalizeMarketArrays(markets[0]);
+  // Heurística: multi-outcome real suele tener >2 outcomes/tokenIds
+  return Array.isArray(outcomes) && outcomes.length > 2 && Array.isArray(clobTokenIds) && clobTokenIds.length === outcomes.length;
+}
+
+function buildOutcomesFromSingleMultiMarket(market) {
+  const { outcomes, outcomePrices, clobTokenIds } = normalizeMarketArrays(market);
+
+  // Si falta algo crítico, devolvemos vacío para que el caller haga fallback
+  if (!Array.isArray(outcomes) || outcomes.length === 0) return [];
+
+  return outcomes.map((name, i) => {
+    const tokenId = Array.isArray(clobTokenIds) ? clobTokenIds[i] : null;
+    const price = Array.isArray(outcomePrices) ? toNumber(outcomePrices[i], 0.5) : 0.5;
+
+    return {
+      index: i,                 // índice del outcome dentro del market
+      name: String(name),
+      tokenId: tokenId != null ? String(tokenId) : null,
+      yesPrice: clamp(price, 0, 1) // aquí "yesPrice" significa "precio del outcome"
+    };
+  });
+}
+
+function buildOutcomesFromMarketsAsOptions(markets) {
+  // Modelo "market-per-option": cada market es una opción binaria NO/YES
+  return markets.map((m, idx) => {
+    const { outcomePrices, clobTokenIds } = normalizeMarketArrays(m);
+
+    // Heurística binaria: [NO, YES] => YES es el segundo
+    const yesPrice = outcomePrices.length >= 2 ? toNumber(outcomePrices[1], 0.5) : toNumber(outcomePrices[0], 0.5);
+    const yesTokenId = clobTokenIds.length >= 2 ? clobTokenIds[1] : clobTokenIds[0];
+
+    return {
+      index: idx, // índice del market dentro del evento
+      name: m?.question || `Market ${idx + 1}`,
+      tokenId: yesTokenId != null ? String(yesTokenId) : null,
+      yesPrice: clamp(yesPrice, 0, 1)
+    };
+  });
+}
+
+async function fetchClobBest(tokenId, signal) {
+  const url = `https://clob.polymarket.com/best?token_id=${encodeURIComponent(tokenId)}`;
+  const data = await fetchJson(url, { signal });
+
+  // soportar varias claves posibles
+  const bid = toNumber(data?.best_bid, NaN);
+  const ask = toNumber(data?.best_ask, NaN);
+
+  return {
+    raw: data,
+    bid: Number.isFinite(bid) ? bid : null,
+    ask: Number.isFinite(ask) ? ask : null
+  };
+}
+
+// ---------------- API: market-data ----------------
+
+async function fetchMarketData(slug) {
+  const { controller, timeoutId } = withTimeout(10000);
   try {
-    const controller = new AbortController();
-    const timeoutId = setTimeout(() => controller.abort(), 10000);
-
-    // outcomeIndex opcional; por defecto 0 (primer market)
-    const outcomeIndexParam = res.req.query.outcomeIndex;
-    const outcomeIndex =
-      outcomeIndexParam !== undefined ? parseInt(outcomeIndexParam, 10) : 0;
-
-    const gammaUrl = `https://gamma-api.polymarket.com/events?slug=${encodeURIComponent(slug)}`;
-    const gammaResponse = await fetch(gammaUrl, { signal: controller.signal });
-
-    if (!gammaResponse.ok) {
-      clearTimeout(timeoutId);
-      return res.status(gammaResponse.status).json({
-        error: `Gamma API error: ${gammaResponse.status}`
-      });
-    }
-
-    const events = await gammaResponse.json();
-    const eventData = events[0];
+    const eventData = await fetchGammaEventBySlug(slug, controller.signal);
     const markets = Array.isArray(eventData?.markets) ? eventData.markets : [];
-
     if (markets.length === 0) {
-      clearTimeout(timeoutId);
-      return res.status(404).json({
-        error: 'Market not found'
-      });
+      const e = new Error('No active markets for this event');
+      e.statusCode = 404;
+      throw e;
     }
 
-    // Aseguramos índice válido de market
-    const safeIndex = Math.min(Math.max(0, outcomeIndex), markets.length - 1);
-    const market = markets[safeIndex];
+    const marketName = eventData?.title || 'Polymarket Event';
 
-    // outcomePrices del market elegido
-    let prices = [];
-    try {
-      prices = JSON.parse(market.outcomePrices || '[]');
-    } catch (e) {
-      prices = [];
+    // volumen total (sumando markets)
+    const totalVolume = markets.reduce((acc, m) => acc + toNumber(m?.volume, 0), 0);
+
+    let model = 'market-per-option';
+    let outcomes = [];
+
+    if (isMultiOutcomeSingleMarket(markets)) {
+      model = 'single-market-multi-outcome';
+      outcomes = buildOutcomesFromSingleMultiMarket(markets[0]);
+    } else {
+      outcomes = buildOutcomesFromMarketsAsOptions(markets);
     }
 
-    // clobTokenIds del market elegido
-    let tokenIds = market.clobTokenIds;
-    if (typeof tokenIds === 'string') {
-      try {
-        tokenIds = JSON.parse(tokenIds);
-      } catch (e) {
-        // lo dejamos
-      }
+    if (outcomes.length === 0) {
+      const e = new Error('Could not build outcomes for this event (unsupported Gamma shape)');
+      e.statusCode = 422;
+      throw e;
     }
 
-    // Heurística YES token: segundo si hay 2, si no primero
-    let yesTokenId = null;
-    if (Array.isArray(tokenIds) && tokenIds.length > 0) {
-      yesTokenId = tokenIds.length >= 2 ? tokenIds[1] : tokenIds[0];
-    }
+    const bestOutcome = outcomes.reduce((prev, curr) => (curr.yesPrice > prev.yesPrice ? curr : prev), outcomes[0]);
+    const midPrice = bestOutcome?.yesPrice ?? 0.5;
 
-    let bid = 0.5;
-    let ask = 0.5;
-
-    // Intentamos libro de órdenes CLOB
-    if (yesTokenId) {
-      const bestUrl = `https://clob.polymarket.com/best?token_id=${yesTokenId}`;
-      const bestResponse = await fetch(bestUrl, { signal: controller.signal });
-
-      if (bestResponse.ok) {
-        const bestData = await bestResponse.json();
-        bid = parseFloat(bestData.best_bid || 0);
-        ask = parseFloat(bestData.best_ask || 0);
-      }
-    }
-
-    // Si no hay órdenes, usamos outcomePrices como mid
-    if (bid === 0 && ask === 0) {
-      let mid = 0.5;
-      if (prices.length >= 2) {
-        mid = parseFloat(prices[1] || '0.5');
-      } else if (prices.length === 1) {
-        mid = parseFloat(prices[0] || '0.5');
-      }
-      if (isNaN(mid)) mid = 0.5;
-      bid = mid * 0.98;
-      ask = mid;
-    }
-
-    // Ensure logical spread
-    if (bid >= ask) {
-      bid = ask * 0.98;
-    }
-
-    clearTimeout(timeoutId);
-
-    return res.status(200).json({
-      success: true,
-      bid: parseFloat(bid.toFixed(4)),
-      ask: parseFloat(ask.toFixed(4)),
-      spread: parseFloat(((ask - bid) * 100).toFixed(2)),
-      volume: market.volume || 0,
-      outcomeIndex: safeIndex,
-      tokenId: yesTokenId,
+    return {
+      slug,
+      marketName,
+      volume: totalVolume,
+      midPrice,
+      model,
+      outcomes,
       timestamp: new Date().toISOString()
-    });
-  } catch (error) {
-    console.error('Error fetching prices:', error);
-    return res.status(500).json({
-      error: error.message || 'Internal Server Error'
-    });
+    };
+  } finally {
+    clearTimeout(timeoutId);
   }
 }
+
+// ---------------- API: prices ----------------
+
+async function fetchPrices({ slug, tokenId, outcomeIndex }) {
+  const { controller, timeoutId } = withTimeout(10000);
+  try {
+    const eventData = await fetchGammaEventBySlug(slug, controller.signal);
+    const markets = Array.isArray(eventData?.markets) ? eventData.markets : [];
+    if (markets.length === 0) {
+      const e = new Error('Market not found');
+      e.statusCode = 404;
+      throw e;
+    }
+
+    // Construimos outcomes con el mismo detector que market-data
+    const model = isMultiOutcomeSingleMarket(markets) ? 'single-market-multi-outcome' : 'market-per-option';
+    const outcomes = model === 'single-market-multi-outcome'
+      ? buildOutcomesFromSingleMultiMarket(markets[0])
+      : buildOutcomesFromMarketsAsOptions(markets);
+
+    // Resolver tokenId
+    let resolvedTokenId = tokenId != null ? String(tokenId) : null;
+    let resolvedIndex = null;
+
+    if (!resolvedTokenId) {
+      const idx = outcomeIndex !== undefined ? parseInt(outcomeIndex, 10) : 0;
+      const safeIndex = clamp(Number.isFinite(idx) ? idx : 0, 0, outcomes.length - 1);
+      resolvedIndex = safeIndex;
+      resolvedTokenId = outcomes[safeIndex]?.tokenId || null;
+    } else {
+      // encontrar índice informativo
+      const found = outcomes.findIndex(o => o?.tokenId != null && String(o.tokenId) === String(resolvedTokenId));
+      resolvedIndex = found >= 0 ? found : null;
+    }
+
+    // fallback mid desde el outcome seleccionado (si existe)
+    let fallbackMid = 0.5;
+    if (resolvedIndex != null && outcomes[resolvedIndex]) {
+      fallbackMid = clamp(toNumber(outcomes[resolvedIndex].yesPrice, 0.5), 0, 1);
+    }
+
+    // CLOB best
+    let bid = null, ask = null, clobRaw = null;
+    if (resolvedTokenId) {
+      try {
+        const best = await fetchClobBest(resolvedTokenId, controller.signal);
+        clobRaw = best.raw;
+        bid = best.bid;
+        ask = best.ask;
+      } catch (e) {
+        // seguimos con fallback
+      }
+    }
+
+    // fallback si no hay libro
+    if (!Number.isFinite(bid) || !Number.isFinite(ask) || bid == null || ask == null || (bid === 0 && ask === 0)) {
+      ask = fallbackMid;
+      bid = clamp(fallbackMid * 0.98, 0, 1);
+    }
+
+    bid = clamp(toNumber(bid, 0.5), 0, 1);
+    ask = clamp(toNumber(ask, 0.5), 0, 1);
+    if (bid >= ask) bid = clamp(ask * 0.98, 0, 1);
+
+    // volumen: en multi-outcome single market, el volumen está en markets[0]
+    // en market-per-option, el volumen está en el market correspondiente (si resolvedIndex coincide)
+    let volume = 0;
+    if (model === 'single-market-multi-outcome') {
+      volume = toNumber(markets[0]?.volume, 0);
+    } else if (resolvedIndex != null && markets[resolvedIndex]) {
+      volume = toNumber(markets[resolvedIndex]?.volume, 0);
+    }
+
+    return {
+      slug,
+      model,
+      outcomeIndex: resolvedIndex,
+      tokenId: resolvedTokenId,
+      bid: Number(bid.toFixed(4)),
+      ask: Number(ask.toFixed(4)),
+      spread: Number(((ask - bid) * 100).toFixed(2)),
+      volume,
+      timestamp: new Date().toISOString(),
+      // quita esto en prod si no lo quieres
+      debug: {
+        usedClob: !!clobRaw,
+        fallbackMid: Number(fallbackMid.toFixed(4))
+      }
+    };
+  } finally {
+    clearTimeout(timeoutId);
+  }
+}
+
 
 

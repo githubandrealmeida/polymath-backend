@@ -33,13 +33,13 @@ export default async (req, res) => {
       timestamp: new Date().toISOString(),
       endpoints: {
         marketData: '/api/polymarket?type=market-data&slug=YOUR_SLUG',
-        prices: '/api/polymarket?type=prices&slug=YOUR_SLUG'
+        prices: '/api/polymarket?type=prices&slug=YOUR_SLUG&outcomeIndex=0'
       }
     });
   }
 };
 
-// Fetch market data from Gamma API
+// Fetch market data from Gamma API (TODOS los outcomes)
 async function fetchMarketData(slug, res) {
   try {
     const controller = new AbortController();
@@ -76,39 +76,61 @@ async function fetchMarketData(slug, res) {
       });
     }
 
-    // Parse token IDs
-    let tokenIds;
-    if (typeof market.clobTokenIds === 'string') {
-      try {
-        tokenIds = JSON.parse(market.clobTokenIds);
-      } catch (e) {
-        tokenIds = market.clobTokenIds;
-      }
-    } else {
-      tokenIds = market.clobTokenIds;
-    }
-
-    // Validate binary market
-    if (!Array.isArray(tokenIds) || tokenIds.length !== 2) {
-      return res.status(400).json({
-        error: 'This market is not binary (YES/NO). App supports only 2-option markets.',
-        slug: slug
-      });
-    }
-
-    const yesTokenId = tokenIds[1]; // Index 1 is YES
     const marketName = market.question || eventData.title;
     const volume = parseFloat(market.volume || 0);
-    const outcomePrices = JSON.parse(market.outcomePrices || '["0.5","0.5"]');
-    const mid = parseFloat(outcomePrices[1]);
+
+    // outcomePrices = array de strings con precios YES por outcome
+    let outcomePrices = [];
+    try {
+      outcomePrices = JSON.parse(market.outcomePrices || '[]');
+    } catch (e) {
+      outcomePrices = [];
+    }
+
+    // Metadatos de outcomes si están disponibles
+    const outcomesMeta = market.outcomes || market.outcomeTokens || [];
+
+    // clobTokenIds puede ser string JSON o array
+    let tokenIdsRaw = market.clobTokenIds;
+    if (typeof tokenIdsRaw === 'string') {
+      try {
+        tokenIdsRaw = JSON.parse(tokenIdsRaw);
+      } catch (e) {
+        // lo dejamos tal cual
+      }
+    }
+
+    const outcomes = [];
+
+    if (Array.isArray(outcomePrices) && outcomePrices.length > 0) {
+      for (let i = 0; i < outcomePrices.length; i++) {
+        const yesPrice = parseFloat(outcomePrices[i]);
+        const meta = outcomesMeta[i] || {};
+        const name = meta.name || meta.ticker || `Outcome ${i + 1}`;
+        const tokenId = Array.isArray(tokenIdsRaw) ? tokenIdsRaw[i] : null;
+
+        outcomes.push({
+          index: i,
+          name,
+          yesPrice,
+          tokenId
+        });
+      }
+    }
+
+    // midPrice por defecto: outcome 1 si existe, si no outcome 0, si no 0.5
+    const mid =
+      outcomes[1]?.yesPrice ??
+      outcomes[0]?.yesPrice ??
+      0.5;
 
     return res.status(200).json({
       success: true,
       marketName,
-      yesTokenId,
       volume,
+      slug,
       midPrice: mid,
-      slug: slug,
+      outcomes, // lista de candidatos/outcomes
       timestamp: new Date().toISOString()
     });
   } catch (error) {
@@ -120,13 +142,17 @@ async function fetchMarketData(slug, res) {
   }
 }
 
-// Fetch prices from CLOB API
+// Fetch prices from CLOB API (outcome concreto)
 async function fetchPrices(slug, res) {
   try {
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), 10000);
 
-    // First get market data to get token ID
+    // outcomeIndex opcional; por defecto 1 (segundo outcome), para no romper lo viejo
+    const outcomeIndexParam = res.req.query.outcomeIndex;
+    const outcomeIndex =
+      outcomeIndexParam !== undefined ? parseInt(outcomeIndexParam, 10) : 1;
+
     const gammaUrl = `https://gamma-api.polymarket.com/events?slug=${encodeURIComponent(slug)}`;
     const gammaResponse = await fetch(gammaUrl, { signal: controller.signal });
 
@@ -148,49 +174,51 @@ async function fetchPrices(slug, res) {
       });
     }
 
-    let tokenIds;
-    if (typeof market.clobTokenIds === 'string') {
-      try {
-        tokenIds = JSON.parse(market.clobTokenIds);
-      } catch (e) {
-        tokenIds = market.clobTokenIds;
-      }
-    } else {
-      tokenIds = market.clobTokenIds;
+    let outcomePrices = [];
+    try {
+      outcomePrices = JSON.parse(market.outcomePrices || '[]');
+    } catch (e) {
+      outcomePrices = [];
     }
 
-    if (!Array.isArray(tokenIds) || tokenIds.length !== 2) {
+    let tokenIds = market.clobTokenIds;
+    if (typeof tokenIds === 'string') {
+      try {
+        tokenIds = JSON.parse(tokenIds);
+      } catch (e) {
+        // lo dejamos
+      }
+    }
+
+    if (!Array.isArray(outcomePrices) || outcomePrices.length === 0) {
       clearTimeout(timeoutId);
       return res.status(400).json({
-        error: 'Not a binary market'
+        error: 'No outcome prices available for this market'
       });
     }
 
-    const yesTokenId = tokenIds[1];
+    // Aseguramos índice válido
+    const safeIndex = Math.min(Math.max(0, outcomeIndex), outcomePrices.length - 1);
 
-    // Get prices from CLOB
-    const bestUrl = `https://clob.polymarket.com/best?token_id=${yesTokenId}`;
-    const bestResponse = await fetch(bestUrl, { signal: controller.signal });
+    const yesTokenId = Array.isArray(tokenIds) ? tokenIds[safeIndex] : null;
 
-    let bid = 0.50;
-    let ask = 0.50;
+    let bid = 0.5;
+    let ask = 0.5;
 
-    if (bestResponse.ok) {
-      const bestData = await bestResponse.json();
-      bid = parseFloat(bestData.best_bid || 0);
-      ask = parseFloat(bestData.best_ask || 0);
+    if (yesTokenId) {
+      const bestUrl = `https://clob.polymarket.com/best?token_id=${yesTokenId}`;
+      const bestResponse = await fetch(bestUrl, { signal: controller.signal });
 
-      // Fallback if orderbook empty
-      if (bid === 0 && ask === 0) {
-        const outcomePrices = JSON.parse(market.outcomePrices || '["0.5","0.5"]');
-        const mid = parseFloat(outcomePrices[1]);
-        bid = mid * 0.98;
-        ask = mid;
+      if (bestResponse.ok) {
+        const bestData = await bestResponse.json();
+        bid = parseFloat(bestData.best_bid || 0);
+        ask = parseFloat(bestData.best_ask || 0);
       }
-    } else {
-      // Fallback to Gamma prices
-      const outcomePrices = JSON.parse(market.outcomePrices || '["0.5","0.5"]');
-      const mid = parseFloat(outcomePrices[1]);
+    }
+
+    // Si no hay libro o no hay tokenId, usamos outcomePrices como mid
+    if (bid === 0 && ask === 0) {
+      const mid = parseFloat(outcomePrices[safeIndex] || '0.5');
       bid = mid * 0.98;
       ask = mid;
     }
@@ -208,6 +236,8 @@ async function fetchPrices(slug, res) {
       ask: parseFloat(ask.toFixed(4)),
       spread: parseFloat(((ask - bid) * 100).toFixed(2)),
       volume: market.volume || 0,
+      outcomeIndex: safeIndex,
+      tokenId: yesTokenId,
       timestamp: new Date().toISOString()
     });
   } catch (error) {
@@ -217,3 +247,4 @@ async function fetchPrices(slug, res) {
     });
   }
 }
+

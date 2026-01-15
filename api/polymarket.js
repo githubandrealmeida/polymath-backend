@@ -1,4 +1,14 @@
 // /api/polymarket.js
+// Backend API para Polymarket (Gamma + CLOB)
+// - Soporta 2 formas de eventos Gamma:
+//   1) single-market-multi-outcome: un solo market con muchos outcomes (cada outcome es una opción)
+//   2) market-per-option: muchos markets binarios (Yes/No) donde cada market es una opción
+//
+// Refactor clave:
+// - En markets binarios, NO asumir orden [NO, YES]. Resolver índices por el texto de `outcomes` ("Yes"/"No").
+// - Exponer yesTokenId/noTokenId cuando existan, para poder pedir BID/ASK reales de ambos lados.
+// - Mantener compatibilidad: `tokenId` sigue apuntando al YES por defecto.
+
 export default async function handler(req, res) {
   // CORS
   res.setHeader('Access-Control-Allow-Credentials', 'true');
@@ -16,15 +26,16 @@ export default async function handler(req, res) {
 
   try {
     if (type === 'market-data' && slug) {
-      const data = await fetchMarketData(slug);
+      const data = await fetchMarketData(String(slug));
       return res.status(200).json({ success: true, ...data });
     }
 
     if (type === 'prices' && slug) {
       const data = await fetchPrices({
-        slug,
+        slug: String(slug),
         tokenId: req.query.tokenId,
-        outcomeIndex: req.query.outcomeIndex
+        outcomeIndex: req.query.outcomeIndex,
+        side: req.query.side, // opcional: "yes" | "no" (si no, usa tokenId o YES por defecto)
       });
       return res.status(200).json({ success: true, ...data });
     }
@@ -37,8 +48,9 @@ export default async function handler(req, res) {
       endpoints: {
         marketData: '/api/polymarket?type=market-data&slug=YOUR_SLUG',
         pricesByToken: '/api/polymarket?type=prices&slug=YOUR_SLUG&tokenId=TOKEN_ID',
-        pricesLegacy: '/api/polymarket?type=prices&slug=YOUR_SLUG&outcomeIndex=0'
-      }
+        pricesByIndex: '/api/polymarket?type=prices&slug=YOUR_SLUG&outcomeIndex=0',
+        pricesByIndexSide: '/api/polymarket?type=prices&slug=YOUR_SLUG&outcomeIndex=0&side=yes',
+      },
     });
   } catch (err) {
     const status = err?.statusCode || 500;
@@ -46,12 +58,20 @@ export default async function handler(req, res) {
   }
 }
 
-// ---------------- Helpers ----------------
+// ---------------- Utilities ----------------
 
 function withTimeout(ms = 10000) {
   const controller = new AbortController();
   const timeoutId = setTimeout(() => controller.abort(), ms);
   return { controller, timeoutId };
+}
+
+async function safeReadText(resp) {
+  try {
+    return await resp.text();
+  } catch {
+    return '';
+  }
 }
 
 async function fetchJson(url, { signal } = {}) {
@@ -65,15 +85,15 @@ async function fetchJson(url, { signal } = {}) {
   return r.json();
 }
 
-async function safeReadText(resp) {
-  try { return await resp.text(); } catch { return ''; }
-}
-
 function parseMaybeJson(value, fallback) {
   if (value == null) return fallback;
   if (Array.isArray(value)) return value;
   if (typeof value !== 'string') return fallback;
-  try { return JSON.parse(value); } catch { return fallback; }
+  try {
+    return JSON.parse(value);
+  } catch {
+    return fallback;
+  }
 }
 
 function toNumber(x, fallback = 0) {
@@ -84,6 +104,21 @@ function toNumber(x, fallback = 0) {
 function clamp(n, min, max) {
   return Math.min(Math.max(n, min), max);
 }
+
+function normOutcomeLabel(x) {
+  return String(x ?? '')
+    .trim()
+    .toLowerCase();
+}
+
+function findYesNoIndexes(outcomes) {
+  const outs = Array.isArray(outcomes) ? outcomes.map(normOutcomeLabel) : [];
+  const yesIdx = outs.findIndex(o => o === 'yes');
+  const noIdx = outs.findIndex(o => o === 'no');
+  return { yesIdx, noIdx };
+}
+
+// ---------------- Gamma ----------------
 
 async function fetchGammaEventBySlug(slug, signal) {
   const url = `https://gamma-api.polymarket.com/events?slug=${encodeURIComponent(slug)}`;
@@ -98,9 +133,9 @@ async function fetchGammaEventBySlug(slug, signal) {
 
 function normalizeMarketArrays(market) {
   // Gamma a veces trae strings JSON
-  const outcomes = parseMaybeJson(market?.outcomes, null);          // array de nombres (multi)
+  const outcomes = parseMaybeJson(market?.outcomes, null); // array de nombres
   const outcomePrices = parseMaybeJson(market?.outcomePrices, []); // array de precios
-  const clobTokenIds = parseMaybeJson(market?.clobTokenIds, []);   // array de tokenIds
+  const clobTokenIds = parseMaybeJson(market?.clobTokenIds, []); // array de tokenIds
   return { outcomes, outcomePrices, clobTokenIds };
 }
 
@@ -108,13 +143,19 @@ function isMultiOutcomeSingleMarket(markets) {
   if (!Array.isArray(markets) || markets.length !== 1) return false;
   const { outcomes, clobTokenIds } = normalizeMarketArrays(markets[0]);
   // Heurística: multi-outcome real suele tener >2 outcomes/tokenIds
-  return Array.isArray(outcomes) && outcomes.length > 2 && Array.isArray(clobTokenIds) && clobTokenIds.length === outcomes.length;
+  return (
+    Array.isArray(outcomes) &&
+    outcomes.length > 2 &&
+    Array.isArray(clobTokenIds) &&
+    clobTokenIds.length === outcomes.length
+  );
 }
+
+// ---------------- Outcome builders ----------------
 
 function buildOutcomesFromSingleMultiMarket(market) {
   const { outcomes, outcomePrices, clobTokenIds } = normalizeMarketArrays(market);
 
-  // Si falta algo crítico, devolvemos vacío para que el caller haga fallback
   if (!Array.isArray(outcomes) || outcomes.length === 0) return [];
 
   return outcomes.map((name, i) => {
@@ -122,44 +163,90 @@ function buildOutcomesFromSingleMultiMarket(market) {
     const price = Array.isArray(outcomePrices) ? toNumber(outcomePrices[i], 0.5) : 0.5;
 
     return {
-      index: i,                 // índice del outcome dentro del market
+      index: i, // índice del outcome dentro del market
       name: String(name),
+      // En multi-outcome, cada outcome es "su token" (no es yes/no)
       tokenId: tokenId != null ? String(tokenId) : null,
-      yesPrice: clamp(price, 0, 1) // aquí "yesPrice" significa "precio del outcome"
+      yesTokenId: tokenId != null ? String(tokenId) : null,
+      noTokenId: null,
+      yesPrice: clamp(price, 0, 1), // aquí "yesPrice" = precio del outcome
+      noPrice: null,
+      kind: 'multi-outcome',
     };
   });
 }
 
 function buildOutcomesFromMarketsAsOptions(markets) {
-  // Modelo "market-per-option": cada market es una opción binaria NO/YES
+  // Modelo "market-per-option": cada market es una opción binaria YES/NO
   return markets.map((m, idx) => {
-    const { outcomePrices, clobTokenIds } = normalizeMarketArrays(m);
+    const { outcomes, outcomePrices, clobTokenIds } = normalizeMarketArrays(m);
 
-    // Heurística binaria: [NO, YES] => YES es el segundo
-    const yesPrice = outcomePrices.length >= 2 ? toNumber(outcomePrices[1], 0.5) : toNumber(outcomePrices[0], 0.5);
-    const yesTokenId = clobTokenIds.length >= 2 ? clobTokenIds[1] : clobTokenIds[0];
+    const { yesIdx, noIdx } = findYesNoIndexes(outcomes);
+
+    // Si Gamma no trae outcomes, hacemos fallback (menos fiable)
+    const fallbackYesIdx = outcomePrices.length >= 2 ? 0 : 0; // preferimos 0 como "yes" por defecto
+    const fallbackNoIdx = outcomePrices.length >= 2 ? 1 : null;
+
+    const resolvedYesIdx = yesIdx >= 0 ? yesIdx : fallbackYesIdx;
+    const resolvedNoIdx = noIdx >= 0 ? noIdx : fallbackNoIdx;
+
+    const yesPrice =
+      Array.isArray(outcomePrices) && outcomePrices.length > resolvedYesIdx
+        ? toNumber(outcomePrices[resolvedYesIdx], 0.5)
+        : 0.5;
+
+    const noPrice =
+      resolvedNoIdx != null &&
+      Array.isArray(outcomePrices) &&
+      outcomePrices.length > resolvedNoIdx
+        ? toNumber(outcomePrices[resolvedNoIdx], 0.5)
+        : clamp(1 - yesPrice, 0, 1);
+
+    const yesTokenId =
+      Array.isArray(clobTokenIds) && clobTokenIds.length > resolvedYesIdx
+        ? clobTokenIds[resolvedYesIdx]
+        : null;
+
+    const noTokenId =
+      resolvedNoIdx != null &&
+      Array.isArray(clobTokenIds) &&
+      clobTokenIds.length > resolvedNoIdx
+        ? clobTokenIds[resolvedNoIdx]
+        : null;
 
     return {
       index: idx, // índice del market dentro del evento
       name: m?.question || `Market ${idx + 1}`,
+      // Compatibilidad: tokenId apunta al YES
       tokenId: yesTokenId != null ? String(yesTokenId) : null,
-      yesPrice: clamp(yesPrice, 0, 1)
+      yesTokenId: yesTokenId != null ? String(yesTokenId) : null,
+      noTokenId: noTokenId != null ? String(noTokenId) : null,
+      yesPrice: clamp(yesPrice, 0, 1),
+      noPrice: clamp(noPrice, 0, 1),
+      kind: 'binary',
+      // útil para debug
+      debug: {
+        gammaOutcomes: Array.isArray(outcomes) ? outcomes : null,
+        resolvedYesIdx,
+        resolvedNoIdx,
+      },
     };
   });
 }
+
+// ---------------- CLOB ----------------
 
 async function fetchClobBest(tokenId, signal) {
   const url = `https://clob.polymarket.com/best?token_id=${encodeURIComponent(tokenId)}`;
   const data = await fetchJson(url, { signal });
 
-  // soportar varias claves posibles
   const bid = toNumber(data?.best_bid, NaN);
   const ask = toNumber(data?.best_ask, NaN);
 
   return {
     raw: data,
     bid: Number.isFinite(bid) ? bid : null,
-    ask: Number.isFinite(ask) ? ask : null
+    ask: Number.isFinite(ask) ? ask : null,
   };
 }
 
@@ -177,19 +264,13 @@ async function fetchMarketData(slug) {
     }
 
     const marketName = eventData?.title || 'Polymarket Event';
-
-    // volumen total (sumando markets)
     const totalVolume = markets.reduce((acc, m) => acc + toNumber(m?.volume, 0), 0);
 
-    let model = 'market-per-option';
-    let outcomes = [];
-
-    if (isMultiOutcomeSingleMarket(markets)) {
-      model = 'single-market-multi-outcome';
-      outcomes = buildOutcomesFromSingleMultiMarket(markets[0]);
-    } else {
-      outcomes = buildOutcomesFromMarketsAsOptions(markets);
-    }
+    const model = isMultiOutcomeSingleMarket(markets) ? 'single-market-multi-outcome' : 'market-per-option';
+    const outcomes =
+      model === 'single-market-multi-outcome'
+        ? buildOutcomesFromSingleMultiMarket(markets[0])
+        : buildOutcomesFromMarketsAsOptions(markets);
 
     if (outcomes.length === 0) {
       const e = new Error('Could not build outcomes for this event (unsupported Gamma shape)');
@@ -197,6 +278,7 @@ async function fetchMarketData(slug) {
       throw e;
     }
 
+    // midPrice: para multi-outcome, el "best" outcome por precio; para binario, el "best" yesPrice
     const bestOutcome = outcomes.reduce((prev, curr) => (curr.yesPrice > prev.yesPrice ? curr : prev), outcomes[0]);
     const midPrice = bestOutcome?.yesPrice ?? 0.5;
 
@@ -207,7 +289,7 @@ async function fetchMarketData(slug) {
       midPrice,
       model,
       outcomes,
-      timestamp: new Date().toISOString()
+      timestamp: new Date().toISOString(),
     };
   } finally {
     clearTimeout(timeoutId);
@@ -216,7 +298,7 @@ async function fetchMarketData(slug) {
 
 // ---------------- API: prices ----------------
 
-async function fetchPrices({ slug, tokenId, outcomeIndex }) {
+async function fetchPrices({ slug, tokenId, outcomeIndex, side }) {
   const { controller, timeoutId } = withTimeout(10000);
   try {
     const eventData = await fetchGammaEventBySlug(slug, controller.signal);
@@ -227,13 +309,13 @@ async function fetchPrices({ slug, tokenId, outcomeIndex }) {
       throw e;
     }
 
-    // Construimos outcomes con el mismo detector que market-data
     const model = isMultiOutcomeSingleMarket(markets) ? 'single-market-multi-outcome' : 'market-per-option';
-    const outcomes = model === 'single-market-multi-outcome'
-      ? buildOutcomesFromSingleMultiMarket(markets[0])
-      : buildOutcomesFromMarketsAsOptions(markets);
+    const outcomes =
+      model === 'single-market-multi-outcome'
+        ? buildOutcomesFromSingleMultiMarket(markets[0])
+        : buildOutcomesFromMarketsAsOptions(markets);
 
-    // Resolver tokenId
+    // Resolver outcome seleccionado (por tokenId o por outcomeIndex)
     let resolvedTokenId = tokenId != null ? String(tokenId) : null;
     let resolvedIndex = null;
 
@@ -241,28 +323,50 @@ async function fetchPrices({ slug, tokenId, outcomeIndex }) {
       const idx = outcomeIndex !== undefined ? parseInt(outcomeIndex, 10) : 0;
       const safeIndex = clamp(Number.isFinite(idx) ? idx : 0, 0, outcomes.length - 1);
       resolvedIndex = safeIndex;
-      resolvedTokenId = outcomes[safeIndex]?.tokenId || null;
+
+      // Si el caller pide side=no y tenemos noTokenId, úsalo
+      const s = String(side || '').toLowerCase();
+      if (s === 'no' && outcomes[safeIndex]?.noTokenId) {
+        resolvedTokenId = outcomes[safeIndex].noTokenId;
+      } else {
+        resolvedTokenId = outcomes[safeIndex]?.yesTokenId || outcomes[safeIndex]?.tokenId || null;
+      }
     } else {
       // encontrar índice informativo
-      const found = outcomes.findIndex(o => o?.tokenId != null && String(o.tokenId) === String(resolvedTokenId));
+      const found = outcomes.findIndex(o => {
+        const t = String(resolvedTokenId);
+        return (
+          (o?.tokenId != null && String(o.tokenId) === t) ||
+          (o?.yesTokenId != null && String(o.yesTokenId) === t) ||
+          (o?.noTokenId != null && String(o.noTokenId) === t)
+        );
+      });
       resolvedIndex = found >= 0 ? found : null;
     }
 
     // fallback mid desde el outcome seleccionado (si existe)
     let fallbackMid = 0.5;
+    let selected = null;
     if (resolvedIndex != null && outcomes[resolvedIndex]) {
-      fallbackMid = clamp(toNumber(outcomes[resolvedIndex].yesPrice, 0.5), 0, 1);
+      selected = outcomes[resolvedIndex];
+
+      const s = String(side || '').toLowerCase();
+      if (s === 'no' && selected?.noPrice != null) fallbackMid = clamp(toNumber(selected.noPrice, 0.5), 0, 1);
+      else fallbackMid = clamp(toNumber(selected.yesPrice, 0.5), 0, 1);
     }
 
     // CLOB best
-    let bid = null, ask = null, clobRaw = null;
+    let bid = null,
+      ask = null,
+      clobRaw = null;
+
     if (resolvedTokenId) {
       try {
         const best = await fetchClobBest(resolvedTokenId, controller.signal);
         clobRaw = best.raw;
         bid = best.bid;
         ask = best.ask;
-      } catch (e) {
+      } catch {
         // seguimos con fallback
       }
     }
@@ -277,8 +381,7 @@ async function fetchPrices({ slug, tokenId, outcomeIndex }) {
     ask = clamp(toNumber(ask, 0.5), 0, 1);
     if (bid >= ask) bid = clamp(ask * 0.98, 0, 1);
 
-    // volumen: en multi-outcome single market, el volumen está en markets[0]
-    // en market-per-option, el volumen está en el market correspondiente (si resolvedIndex coincide)
+    // volumen
     let volume = 0;
     if (model === 'single-market-multi-outcome') {
       volume = toNumber(markets[0]?.volume, 0);
@@ -296,11 +399,22 @@ async function fetchPrices({ slug, tokenId, outcomeIndex }) {
       spread: Number(((ask - bid) * 100).toFixed(2)),
       volume,
       timestamp: new Date().toISOString(),
-      // quita esto en prod si no lo quieres
+      // debug útil durante integración
       debug: {
         usedClob: !!clobRaw,
-        fallbackMid: Number(fallbackMid.toFixed(4))
-      }
+        fallbackMid: Number(fallbackMid.toFixed(4)),
+        selectedOutcome: selected
+          ? {
+              name: selected.name,
+              kind: selected.kind,
+              yesPrice: selected.yesPrice,
+              noPrice: selected.noPrice,
+              yesTokenId: selected.yesTokenId,
+              noTokenId: selected.noTokenId,
+              tokenId: selected.tokenId,
+            }
+          : null,
+      },
     };
   } finally {
     clearTimeout(timeoutId);
